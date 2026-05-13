@@ -1,16 +1,51 @@
 import ctypes
 import html
+import json
 import math
 import os
-import queue
 import re
+import shutil
 import subprocess
 import sys
-import threading
-import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox, ttk
+
+try:
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QFrame,
+        QHBoxLayout,
+        QLabel,
+        QMainWindow,
+        QMessageBox,
+        QPushButton,
+        QSlider,
+        QVBoxLayout,
+        QWidget,
+    )
+except Exception as exc:  # pragma: no cover - shown at runtime
+    Qt = None
+    QTimer = None
+    QIcon = None
+    QApplication = None
+    QCheckBox = None
+    QFrame = None
+    QHBoxLayout = None
+    QLabel = None
+    QMainWindow = None
+    QMessageBox = None
+    QPushButton = None
+    QSlider = None
+    QVBoxLayout = None
+    QWidget = None
+    QT_IMPORT_ERROR = exc
+else:
+    QT_IMPORT_ERROR = None
+
+QT_MAIN_WINDOW_BASE = QMainWindow if QMainWindow is not None else object
 
 try:
     import comtypes
@@ -25,6 +60,9 @@ else:
 
 
 APP_NAME = "Hearing Boost"
+APP_VERSION = "1.0.1"
+GITHUB_URL = "https://github.com/CatGPT-Sys32"
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "hearing-boost-icon.svg"
 APO_DOWNLOAD_URL = "https://sourceforge.net/projects/equalizerapo/files/1.4.2/EqualizerAPO-x64-1.4.2.exe/download"
 APO_INSTALLER_PATH = Path(__file__).resolve().parent / "installers" / "EqualizerAPO-latest.exe"
 APO_CONFIG_CANDIDATES = [
@@ -33,6 +71,18 @@ APO_CONFIG_CANDIDATES = [
 ]
 BOOST_MARKER_BEGIN = "# Hearing Boost begin"
 BOOST_MARKER_END = "# Hearing Boost end"
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+UI_FONT = "Segoe UI" if IS_WINDOWS else "Cantarell"
+UI_BG = "#000000"
+UI_SURFACE = "#ffffff"
+UI_TEXT = "#101010"
+UI_MUTED = "#666660"
+UI_LINE = "#deded8"
+UI_ACCENT = "#000000"
+UI_BUTTON_ACTIVE = "#eeeee8"
+UI_BUTTON_PRESSED = "#e4e4dc"
+UI_BORDER = "#9b9b94"
 
 
 @dataclass
@@ -49,6 +99,8 @@ class ApoSnapshot:
 
 
 def is_admin() -> bool:
+    if not IS_WINDOWS:
+        return False
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
@@ -56,6 +108,13 @@ def is_admin() -> bool:
 
 
 def find_apo_config() -> ApoState:
+    if not IS_WINDOWS:
+        return ApoState(
+            path=None,
+            writable=False,
+            message="Using PulseAudio/PipeWire through pactl.",
+        )
+
     for path in APO_CONFIG_CANDIDATES:
         if path.exists():
             try:
@@ -76,7 +135,7 @@ def find_apo_config() -> ApoState:
     return ApoState(
         path=None,
         writable=False,
-        message="Equalizer APO not found. Windows volume and balance work; boost is capped at 100%.",
+        message="Using Windows audio controls. Equalizer APO not found; boost is capped at 100%.",
     )
 
 
@@ -128,7 +187,11 @@ def download_apo_installer(destination: Path) -> None:
 
 
 class WindowsAudio:
+    backend_name = "Windows"
+
     def __init__(self) -> None:
+        if not IS_WINDOWS:
+            raise RuntimeError("Windows audio controls are only available on Windows.")
         if IMPORT_ERROR:
             raise RuntimeError(f"Missing audio dependency: {IMPORT_ERROR}")
         comtypes.CoInitialize()
@@ -224,230 +287,456 @@ class WindowsAudio:
         return base * 100.0, left * 100.0, right * 100.0
 
 
-class ValueSlider(tk.Frame):
-    def __init__(
-        self,
-        master,
-        variable: tk.DoubleVar,
-        minimum: float,
-        maximum: float,
-        left_label: str,
-        right_label: str,
-        command=None,
-        formatter=None,
-        **kwargs,
-    ) -> None:
-        super().__init__(master, bg="#ffffff", **kwargs)
-        self.variable = variable
-        self.minimum = minimum
-        self.maximum = maximum
-        self.left_label = left_label
-        self.right_label = right_label
-        self.command = command
-        self.formatter = formatter or (lambda value: str(round(value)))
-        self.track_pad = 14
-        self.track_y = 38
-        self.thumb_radius = 6
-        self.dragging = False
+class LinuxAudio:
+    backend_name = "Linux"
+    sink_name = "@DEFAULT_SINK@"
 
-        self.canvas = tk.Canvas(
-            self,
-            height=62,
-            bg="#ffffff",
-            highlightthickness=0,
-            bd=0,
+    def __init__(self) -> None:
+        if not IS_LINUX:
+            raise RuntimeError("Linux audio controls are only available on Linux.")
+        if not shutil.which("pactl"):
+            raise RuntimeError("pactl was not found. Install PulseAudio utilities or PipeWire Pulse compatibility.")
+        self.default_sink = self._run_pactl("get-default-sink").strip()
+        if not self.default_sink:
+            raise RuntimeError("Could not determine the default audio output sink.")
+        self._last_channels: tuple[float, ...] | None = None
+        self.original_channels = self.read_channel_scalars()
+
+    def _run_pactl(self, *args: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["pactl", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("pactl was not found.") from exc
+        except subprocess.CalledProcessError as exc:
+            message = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"pactl failed: {message}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("pactl timed out.") from exc
+        return completed.stdout
+
+    def _default_sink_info(self) -> dict:
+        output = self._run_pactl("--format=json", "list", "sinks")
+        try:
+            sinks = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Could not parse pactl sink information.") from exc
+
+        for sink in sinks:
+            if sink.get("name") == self.default_sink:
+                return sink
+        raise RuntimeError(f"Default sink was not found: {self.default_sink}")
+
+    @property
+    def device_name(self) -> str:
+        info = self._default_sink_info()
+        return str(info.get("description") or info.get("name") or "Default playback device")
+
+    @property
+    def channel_count(self) -> int:
+        return len(self.read_channel_scalars())
+
+    def read_channel_scalars(self) -> tuple[float, ...]:
+        info = self._default_sink_info()
+        volumes = info.get("volume")
+        if not isinstance(volumes, dict) or not volumes:
+            raise RuntimeError("Default sink does not expose channel volume information.")
+
+        channels: list[float] = []
+        for channel in volumes.values():
+            if not isinstance(channel, dict):
+                continue
+            percent_text = str(channel.get("value_percent", "")).strip()
+            match = re.search(r"(-?\d+(?:\.\d+)?)%", percent_text)
+            if match:
+                channels.append(max(0.0, float(match.group(1)) / 100.0))
+                continue
+            value = channel.get("value")
+            if isinstance(value, (int, float)):
+                channels.append(max(0.0, float(value) / 65536.0))
+
+        if not channels:
+            raise RuntimeError("Could not read default sink channel volumes.")
+        return tuple(channels)
+
+    def restore_original(self) -> None:
+        self.restore_channels(self.original_channels)
+        self._last_channels = self.original_channels
+
+    def restore_channels(self, channels: tuple[float, ...]) -> None:
+        self._set_channel_volumes(channels)
+
+    def read_state(self) -> tuple[int, int]:
+        channels = self.read_channel_scalars()
+        if len(channels) < 2:
+            return round(channels[0] * 100), 0
+
+        left = max(0.0, channels[0])
+        right = max(0.0, channels[1])
+        loudest = max(left, right, 0.01)
+        if left >= right:
+            balance = -round((1.0 - (right / loudest)) * 100)
+        else:
+            balance = round((1.0 - (left / loudest)) * 100)
+        return round(loudest * 100), balance
+
+    def _set_channel_volumes(self, channels: tuple[float, ...]) -> None:
+        volume_args = [f"{max(0.0, channel) * 100.0:.0f}%" for channel in channels]
+        self._run_pactl("set-sink-volume", self.sink_name, *volume_args)
+
+    def apply(self, boost_percent: float, balance_percent: float, apo_active: bool) -> tuple[float, float, float]:
+        base = max(0.0, min(5.0, boost_percent / 100.0))
+        balance = max(-100.0, min(100.0, balance_percent)) / 100.0
+
+        left_gain = 1.0
+        right_gain = 1.0
+        if balance > 0:
+            left_gain = 1.0 - balance
+        elif balance < 0:
+            right_gain = 1.0 + balance
+
+        left = max(0.0, base * left_gain)
+        right = max(0.0, base * right_gain)
+        count = max(1, self.channel_count)
+        channels = (left, right, *([base] * max(0, count - 2))) if count >= 2 else (base,)
+        if self._last_channels and len(self._last_channels) == len(channels):
+            if all(abs(old - new) < 0.002 for old, new in zip(self._last_channels, channels)):
+                return base * 100.0, left * 100.0, right * 100.0
+
+        previous_channels = self.read_channel_scalars()
+        try:
+            self._set_channel_volumes(channels)
+        except Exception:
+            self.restore_channels(previous_channels)
+            self._last_channels = previous_channels
+            raise
+
+        self._last_channels = channels
+        return base * 100.0, left * 100.0, right * 100.0
+
+
+def create_audio_backend() -> WindowsAudio | LinuxAudio:
+    if IS_WINDOWS:
+        return WindowsAudio()
+    if IS_LINUX:
+        return LinuxAudio()
+    raise RuntimeError(f"{sys.platform} is not supported yet.")
+
+
+def make_separator() -> QFrame:
+    line = QFrame()
+    line.setObjectName("separator")
+    line.setFrameShape(QFrame.Shape.HLine)
+    return line
+
+
+def app_icon():
+    if QIcon is None or not APP_ICON_PATH.exists():
+        return None
+    icon = QIcon(str(APP_ICON_PATH))
+    return None if icon.isNull() else icon
+
+
+def open_external_url(url: str) -> None:
+    try:
+        if IS_WINDOWS:
+            os.startfile(url)  # type: ignore[attr-defined]
+            return
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        subprocess.Popen(
+            [opener, url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        self.canvas.pack(fill="x", expand=True)
-        self.canvas.bind("<Configure>", lambda _event: self.redraw())
-        self.canvas.bind("<Button-1>", self._set_from_event)
-        self.canvas.bind("<B1-Motion>", self._set_from_event)
-        self.canvas.bind("<ButtonPress-1>", lambda _event: self._set_dragging(True))
-        self.canvas.bind("<ButtonRelease-1>", lambda _event: self._set_dragging(False))
-        self.variable.trace_add("write", lambda *_args: self.redraw())
-        self.redraw()
-
-    def _set_dragging(self, value: bool) -> None:
-        self.dragging = value
-        self.redraw()
-
-    def _set_from_event(self, event) -> None:
-        width = max(1, self.canvas.winfo_width())
-        start = self.track_pad
-        end = width - self.track_pad
-        x = max(start, min(end, event.x))
-        value = self.minimum + ((x - start) / (end - start)) * (self.maximum - self.minimum)
-        self.variable.set(round(value))
-        if self.command:
-            self.command(value)
-        self.redraw()
-
-    def redraw(self) -> None:
-        width = max(1, self.canvas.winfo_width())
-        start = self.track_pad
-        end = width - self.track_pad
-        mid = (start + end) / 2
-        value = max(self.minimum, min(self.maximum, float(self.variable.get())))
-        x = start + ((value - self.minimum) / (self.maximum - self.minimum)) * (end - start)
-        radius = 9 if self.dragging else self.thumb_radius
-
-        self.canvas.delete("all")
-        self.canvas.create_text(start, 11, text=self.left_label, anchor="w", fill="#575d66", font=("Segoe UI", 8))
-        self.canvas.create_text(end, 11, text=self.right_label, anchor="e", fill="#575d66", font=("Segoe UI", 8))
-        self.canvas.create_text(x, 58, text=self.formatter(value), anchor="s", fill="#111318", font=("Segoe UI Semibold", 9))
-        self.canvas.create_line(start, self.track_y, end, self.track_y, fill="#d4d8de", width=1)
-        for tick_x in (start, mid, end):
-            self.canvas.create_line(tick_x, self.track_y - 2, tick_x, self.track_y + 2, fill="#aeb4bd", width=1)
-        self.canvas.create_oval(
-            x - radius,
-            self.track_y - radius,
-            x + radius,
-            self.track_y + radius,
-            fill="#148cff",
-            outline="#148cff",
-        )
+    except Exception:
+        pass
 
 
-class HearingBoostApp(tk.Tk):
+class HearingBoostApp(QT_MAIN_WINDOW_BASE):
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_NAME)
-        self.geometry("500x610")
-        self.minsize(480, 560)
-        self.configure(bg="#f2f3f5")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        icon = app_icon()
+        if icon:
+            self.setWindowIcon(icon)
+        self.resize(460, 560)
+        self.setMinimumSize(420, 500)
 
-        self.audio: WindowsAudio | None = None
+        self.audio: WindowsAudio | LinuxAudio | None = None
         self.apo = find_apo_config()
-        self.apply_after_id: str | None = None
         self.last_apo_boost: int | None = None
         self.apo_snapshot: ApoSnapshot | None = None
         self.closing = False
-        self.worker_busy = False
-        self.pending_apply: tuple[int, int] | None = None
-        self.apply_queue: queue.Queue[tuple[int, int] | None] = queue.Queue()
-        self.result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.worker_thread = threading.Thread(target=self._audio_worker, daemon=True)
+        self.loading = False
 
-        self.boost_var = tk.DoubleVar(value=100)
-        self.balance_var = tk.DoubleVar(value=0)
-        self.session_only_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Starting...")
-        self.device_var = tk.StringVar(value="Default playback device")
-        self.left_var = tk.StringVar(value="L --")
-        self.right_var = tk.StringVar(value="R --")
-        self.apo_var = tk.StringVar(value=self.apo.message)
+        self.apply_timer = QTimer(self)
+        self.apply_timer.setSingleShot(True)
+        self.apply_timer.timeout.connect(self.apply_settings)
 
-        self._configure_style()
+        self._apply_style()
         self._build()
         self._connect_audio()
         self._capture_apo_snapshot()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.worker_thread.start()
-        self.after(100, self._poll_worker_results)
         self._schedule_apply()
 
-    def _configure_style(self) -> None:
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TFrame", background="#f2f3f5")
-        style.configure("Card.TFrame", background="#ffffff", relief="flat")
-        style.configure("TLabel", background="#f2f3f5", foreground="#17191c", font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background="#ffffff", foreground="#17191c", font=("Segoe UI", 10))
-        style.configure("Title.TLabel", background="#ffffff", foreground="#111318", font=("Segoe UI Semibold", 16))
-        style.configure("Muted.TLabel", background="#ffffff", foreground="#666c75", font=("Segoe UI", 9))
-        style.configure("Value.TLabel", background="#ffffff", foreground="#111318", font=("Segoe UI Semibold", 11))
-        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 6))
-        style.configure("TCheckbutton", background="#ffffff", foreground="#17191c", font=("Segoe UI", 9))
-        style.configure("Small.TButton", font=("Segoe UI", 9), padding=(8, 5))
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            f"""
+            QWidget {{
+                background: #000000;
+                color: #f7f7f2;
+                font-family: "{UI_FONT}";
+                font-size: 10pt;
+            }}
+            QLabel#title {{
+                color: #ffffff;
+                font-size: 21pt;
+                font-weight: 700;
+            }}
+            QLabel#caption, QLabel#sliderMark, QLabel#footer {{
+                color: #8b8b84;
+                font-size: 8.5pt;
+            }}
+            QLabel#credits {{
+                color: #8b8b84;
+                font-size: 8.5pt;
+            }}
+            QLabel#credits a {{
+                color: #ffffff;
+                text-decoration: none;
+            }}
+            QLabel#section {{
+                color: #f4f4ef;
+                font-size: 10pt;
+            }}
+            QLabel#metric {{
+                color: #ffffff;
+                font-size: 26pt;
+                font-weight: 700;
+            }}
+            QLabel#balanceMetric {{
+                color: #ffffff;
+                font-size: 14pt;
+                font-weight: 700;
+            }}
+            QLabel#status {{
+                color: #ffffff;
+                font-size: 10pt;
+            }}
+            QFrame#separator {{
+                color: #222222;
+                background: #222222;
+                max-height: 1px;
+                border: 0;
+            }}
+            QPushButton {{
+                background: #050505;
+                color: #ffffff;
+                border: 1px solid #3a3a3a;
+                padding: 8px 14px;
+                min-height: 18px;
+            }}
+            QPushButton:hover {{
+                background: #151515;
+                border-color: #686868;
+            }}
+            QPushButton:pressed {{
+                background: #242424;
+            }}
+            QCheckBox {{
+                color: #ffffff;
+                spacing: 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 13px;
+                height: 13px;
+                border: 1px solid #ffffff;
+                background: #000000;
+            }}
+            QCheckBox::indicator:checked {{
+                background: #ffffff;
+                image: none;
+            }}
+            QSlider {{
+                min-height: 30px;
+                max-height: 30px;
+            }}
+            QSlider::groove:horizontal {{
+                height: 2px;
+                background: #333333;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: #ffffff;
+            }}
+            QSlider::add-page:horizontal {{
+                background: #333333;
+            }}
+            QSlider::handle:horizontal {{
+                background: #ffffff;
+                border: 1px solid #ffffff;
+                width: 14px;
+                height: 14px;
+                margin: -6px 0;
+                border-radius: 7px;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: #cfcfc8;
+                border-color: #cfcfc8;
+            }}
+            """
+        )
 
     def _build(self) -> None:
-        root = ttk.Frame(self, padding=20)
-        root.pack(fill="both", expand=True)
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
 
-        card = ttk.Frame(root, style="Card.TFrame", padding=22)
-        card.pack(fill="both", expand=True)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(34, 30, 34, 28)
+        layout.setSpacing(0)
 
-        ttk.Label(card, text=APP_NAME, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(card, textvariable=self.device_var, style="Muted.TLabel", wraplength=430).pack(anchor="w", pady=(2, 20))
+        self.title_label = QLabel(APP_NAME)
+        self.title_label.setObjectName("title")
+        layout.addWidget(self.title_label)
 
-        boost_section = ttk.Frame(card, style="Card.TFrame")
-        boost_section.pack(fill="x", pady=(0, 18))
-        boost_header = ttk.Frame(boost_section, style="Card.TFrame")
-        boost_header.pack(fill="x")
-        ttk.Label(boost_header, text="Output boost", style="Card.TLabel").pack(side="left")
-        self.boost_label = ttk.Label(boost_header, text="100%", style="Value.TLabel", width=7, anchor="e")
-        self.boost_label.pack(side="right")
-        ttk.Label(
-            boost_section,
-            text="Above 100% uses Equalizer APO. Higher values may clip.",
-            style="Muted.TLabel",
-            wraplength=430,
-        ).pack(anchor="w", pady=(2, 4))
-        self.boost_slider = ValueSlider(
-            boost_section,
-            variable=self.boost_var,
-            minimum=0,
-            maximum=500,
-            left_label="0%",
-            right_label="500%",
-            formatter=lambda value: f"{round(value)}%",
-            command=lambda _value: self._on_boost_changed(),
-        )
-        self.boost_slider.pack(fill="x")
+        self.device_label = QLabel("Default playback device")
+        self.device_label.setObjectName("caption")
+        self.device_label.setWordWrap(True)
+        layout.addWidget(self.device_label)
+        layout.addSpacing(30)
 
-        balance_section = ttk.Frame(card, style="Card.TFrame")
-        balance_section.pack(fill="x", pady=(0, 14))
-        balance_header = ttk.Frame(balance_section, style="Card.TFrame")
-        balance_header.pack(fill="x")
-        ttk.Label(balance_header, text="Left/right sound balance", style="Card.TLabel").pack(side="left")
-        balance_values = ttk.Frame(balance_header, style="Card.TFrame")
-        balance_values.pack(side="right")
-        ttk.Label(balance_values, textvariable=self.left_var, style="Value.TLabel").pack(side="left")
-        ttk.Label(balance_values, text="  /  ", style="Muted.TLabel").pack(side="left")
-        ttk.Label(balance_values, textvariable=self.right_var, style="Value.TLabel").pack(side="left")
-        ttk.Label(balance_section, text="Bias sound toward the ear that needs help.", style="Muted.TLabel").pack(anchor="w", pady=(2, 4))
-        self.balance_slider = ValueSlider(
-            balance_section,
-            variable=self.balance_var,
-            minimum=-100,
-            maximum=100,
-            left_label="Left",
-            right_label="Right",
-            formatter=lambda value: "Center" if round(value) == 0 else f"{abs(round(value))}% {'R' if value > 0 else 'L'}",
-            command=lambda _value: self._on_balance_changed(),
-        )
-        self.balance_slider.pack(fill="x")
+        boost_header = QHBoxLayout()
+        boost_header.setContentsMargins(0, 0, 0, 0)
+        boost_title = QLabel("Boost")
+        boost_title.setObjectName("section")
+        boost_header.addWidget(boost_title)
+        boost_header.addStretch(1)
+        self.boost_label = QLabel("100%")
+        self.boost_label.setObjectName("metric")
+        boost_header.addWidget(self.boost_label)
+        layout.addLayout(boost_header)
 
-        controls = ttk.Frame(card, style="Card.TFrame")
-        controls.pack(fill="x", pady=(0, 18))
-        ttk.Button(controls, text="Center balance", style="Small.TButton", command=self.center_balance).pack(side="left")
-        ttk.Button(controls, text="Reset session", style="Small.TButton", command=self.reset).pack(side="right")
+        self.boost_slider = QSlider(Qt.Orientation.Horizontal)
+        self.boost_slider.setRange(0, 500)
+        self.boost_slider.setValue(100)
+        self.boost_slider.valueChanged.connect(self._on_boost_changed)
+        layout.addWidget(self.boost_slider)
 
-        ttk.Checkbutton(
-            card,
-            text="Restore original settings when closing",
-            variable=self.session_only_var,
-            style="TCheckbutton",
-        ).pack(anchor="w", pady=(0, 18))
+        boost_marks = self._mark_row("0%", "500%")
+        layout.addLayout(boost_marks)
+        layout.addSpacing(26)
+        layout.addWidget(make_separator())
+        layout.addSpacing(26)
 
-        ttk.Separator(card).pack(fill="x", pady=(2, 12))
-        ttk.Label(card, textvariable=self.status_var, style="Value.TLabel", wraplength=430).pack(anchor="w", pady=(0, 6))
-        ttk.Label(card, textvariable=self.apo_var, style="Muted.TLabel", wraplength=430).pack(anchor="w")
-        apo_controls = ttk.Frame(card, style="Card.TFrame")
-        apo_controls.pack(fill="x", pady=(8, 0))
-        ttk.Button(apo_controls, text="Install APO", style="Small.TButton", command=self.install_apo).pack(side="left")
-        ttk.Button(apo_controls, text="Refresh", style="Small.TButton", command=self.refresh_apo).pack(side="left", padx=(8, 0))
+        balance_header = QHBoxLayout()
+        balance_header.setContentsMargins(0, 0, 0, 0)
+        balance_title = QLabel("Balance")
+        balance_title.setObjectName("section")
+        balance_header.addWidget(balance_title)
+        balance_header.addStretch(1)
+        self.left_label = QLabel("L --")
+        self.left_label.setObjectName("balanceMetric")
+        self.right_label = QLabel("R --")
+        self.right_label.setObjectName("balanceMetric")
+        balance_header.addWidget(self.left_label)
+        balance_header.addSpacing(14)
+        balance_header.addWidget(self.right_label)
+        layout.addLayout(balance_header)
+
+        self.balance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.balance_slider.setRange(-100, 100)
+        self.balance_slider.setValue(0)
+        self.balance_slider.valueChanged.connect(self._on_balance_changed)
+        layout.addWidget(self.balance_slider)
+
+        self.balance_value_label = QLabel("Center")
+        self.balance_value_label.setObjectName("caption")
+        self.balance_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.balance_value_label)
+        layout.addLayout(self._mark_row("Left", "Right"))
+        layout.addSpacing(26)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        self.center_button = QPushButton("Center balance")
+        self.center_button.clicked.connect(self.center_balance)
+        self.reset_button = QPushButton("Reset session")
+        self.reset_button.clicked.connect(self.reset)
+        controls.addWidget(self.center_button)
+        controls.addStretch(1)
+        controls.addWidget(self.reset_button)
+        layout.addLayout(controls)
+        layout.addSpacing(22)
+
+        self.session_checkbox = QCheckBox("Restore original settings when closing")
+        self.session_checkbox.setChecked(True)
+        layout.addWidget(self.session_checkbox)
+        layout.addSpacing(24)
+        layout.addWidget(make_separator())
+        layout.addSpacing(16)
+
+        self.status_label = QLabel("Starting...")
+        self.status_label.setObjectName("status")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.apo_label = QLabel(self.apo.message)
+        self.apo_label.setObjectName("footer")
+        self.apo_label.setWordWrap(True)
+        layout.addWidget(self.apo_label)
+        layout.addStretch(1)
+
+        self.credits_label = QLabel(f'v{APP_VERSION}  |  by <a href="{GITHUB_URL}">CatGPT-Sys32</a>')
+        self.credits_label.setObjectName("credits")
+        self.credits_label.setOpenExternalLinks(False)
+        self.credits_label.setTextFormat(Qt.TextFormat.RichText)
+        self.credits_label.linkActivated.connect(open_external_url)
+        layout.addWidget(self.credits_label)
+
+        if IS_WINDOWS:
+            layout.addSpacing(14)
+            apo_controls = QHBoxLayout()
+            self.install_button = QPushButton("Install APO")
+            self.install_button.clicked.connect(self.install_apo)
+            self.refresh_button = QPushButton("Refresh")
+            self.refresh_button.clicked.connect(self.refresh_apo)
+            apo_controls.addWidget(self.install_button)
+            apo_controls.addWidget(self.refresh_button)
+            apo_controls.addStretch(1)
+            layout.addLayout(apo_controls)
+
+    def _mark_row(self, left: str, right: str) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 2, 0, 0)
+        left_label = QLabel(left)
+        left_label.setObjectName("sliderMark")
+        right_label = QLabel(right)
+        right_label.setObjectName("sliderMark")
+        row.addWidget(left_label)
+        row.addStretch(1)
+        row.addWidget(right_label)
+        return row
 
     def _connect_audio(self) -> None:
         try:
-            self.audio = WindowsAudio()
+            self.audio = create_audio_backend()
             current_volume, current_balance = self.audio.read_state()
-            self.boost_var.set(current_volume)
-            self.balance_var.set(current_balance)
-            self.device_var.set(self.audio.device_name)
-            self.status_var.set("Ready.")
+            self.loading = True
+            self.boost_slider.setValue(current_volume)
+            self.balance_slider.setValue(current_balance)
+            self.loading = False
+            self._update_labels()
+            self.device_label.setText(self.audio.device_name)
+            self.status_label.setText("Ready.")
         except Exception as exc:
-            self.status_var.set(f"Could not access Windows audio controls: {exc}")
-            messagebox.showerror(APP_NAME, str(exc))
+            self.status_label.setText(f"Could not access audio controls: {exc}")
+            QMessageBox.critical(self, APP_NAME, str(exc))
 
     def _capture_apo_snapshot(self) -> None:
         if self.apo.path and self.apo.path.exists() and self.apo.writable:
@@ -460,64 +749,64 @@ class HearingBoostApp(tk.Tk):
                 self.apo_snapshot = None
 
     def _on_boost_changed(self) -> None:
-        boost = round(float(self.boost_var.get()))
-        self.boost_label.configure(text=f"{boost}%")
-        self._schedule_apply()
+        self._update_labels()
+        if not self.loading:
+            self._schedule_apply()
 
     def _on_balance_changed(self) -> None:
-        self._schedule_apply()
+        self._update_labels()
+        if not self.loading:
+            self._schedule_apply()
 
     def _schedule_apply(self, delay_ms: int = 140) -> None:
-        if self.apply_after_id:
-            self.after_cancel(self.apply_after_id)
-        self.apply_after_id = self.after(delay_ms, self.apply_settings)
+        self.apply_timer.start(delay_ms)
+
+    def _update_labels(self) -> None:
+        boost = self.boost_slider.value()
+        balance = self.balance_slider.value()
+        self.boost_label.setText(f"{boost}%")
+        if balance == 0:
+            self.balance_value_label.setText("Center")
+        else:
+            self.balance_value_label.setText(f"{abs(balance)}% {'R' if balance > 0 else 'L'}")
 
     def apply_settings(self) -> None:
         if self.closing:
             return
-        self.apply_after_id = None
-        boost = round(float(self.boost_var.get()))
-        balance = round(float(self.balance_var.get()))
-        self.boost_label.configure(text=f"{boost}%")
+        boost = self.boost_slider.value()
+        balance = self.balance_slider.value()
+        self.boost_label.setText(f"{boost}%")
 
         if not self.audio:
             return
 
-        self.pending_apply = (boost, balance)
-        if not self.worker_busy:
-            self.worker_busy = True
-            self.apply_queue.put(self.pending_apply)
-            self.pending_apply = None
-            self.status_var.set("Applying...")
+        self.status_label.setText("Applying...")
+        try:
+            windows, left, right, apo_active = self._apply_settings_blocking(boost, balance)
+        except Exception as exc:
+            self.status_label.setText(f"Failed to apply audio settings: {exc}")
+            return
 
-    def _audio_worker(self) -> None:
-        while True:
-            command = self.apply_queue.get()
-            if command is None:
-                return
-
-            while True:
-                try:
-                    newer = self.apply_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if newer is None:
-                    return
-                command = newer
-
-            boost, balance = command
-            try:
-                result = self._apply_settings_blocking(boost, balance)
-                self.result_queue.put(("applied", result))
-            except Exception as exc:
-                self.result_queue.put(("error", str(exc)))
+        self.left_label.setText(f"L {left:.0f}%")
+        self.right_label.setText(f"R {right:.0f}%")
+        backend_name = self.audio.backend_name
+        if apo_active:
+            boost_note = f", APO +{db_for_boost(boost):.1f} dB"
+        elif IS_LINUX and boost > 100:
+            boost_note = ", software boost"
+        else:
+            boost_note = ""
+        if IS_WINDOWS and boost > 100 and not apo_active:
+            self.status_label.setText("Boost above 100% needs Equalizer APO. Applying 100% Windows volume instead.")
+        else:
+            self.status_label.setText(f"Applied {backend_name} {windows:.0f}%: L {left:.0f}% / R {right:.0f}%{boost_note}")
 
     def _apply_settings_blocking(self, boost: int, balance: int) -> tuple[float, float, float, bool]:
         if not self.audio:
-            raise RuntimeError("Windows audio is not connected.")
+            raise RuntimeError("Audio is not connected.")
 
         apo_active = False
-        if boost > 100:
+        if IS_WINDOWS and boost > 100:
             if self.apo.path and self.apo.writable:
                 try:
                     if self.last_apo_boost != boost:
@@ -528,7 +817,7 @@ class HearingBoostApp(tk.Tk):
                     raise RuntimeError(f"Could not write Equalizer APO config: {exc}") from exc
             else:
                 pass
-        elif self.apo.path and self.apo.writable:
+        elif IS_WINDOWS and self.apo.path and self.apo.writable:
             try:
                 if self.last_apo_boost != boost:
                     update_apo_preamp(self.apo.path, boost)
@@ -539,51 +828,22 @@ class HearingBoostApp(tk.Tk):
         windows, left, right = self.audio.apply(boost, balance, apo_active)
         return windows, left, right, apo_active
 
-    def _poll_worker_results(self) -> None:
-        try:
-            while True:
-                kind, payload = self.result_queue.get_nowait()
-                self.worker_busy = False
-                if kind == "applied":
-                    windows, left, right, apo_active = payload
-                    self.left_var.set(f"L {left:.0f}%")
-                    self.right_var.set(f"R {right:.0f}%")
-                    boost = round(float(self.boost_var.get()))
-                    boost_note = f", APO +{db_for_boost(boost):.1f} dB" if apo_active else ""
-                    if boost > 100 and not apo_active:
-                        self.status_var.set("Boost above 100% needs Equalizer APO. Applying 100% Windows volume instead.")
-                    else:
-                        self.status_var.set(f"Applied Windows {windows:.0f}%: L {left:.0f}% / R {right:.0f}%{boost_note}")
-                else:
-                    self.status_var.set(f"Failed to apply audio settings: {payload}")
-
-                if self.pending_apply and not self.worker_busy:
-                    self.worker_busy = True
-                    self.apply_queue.put(self.pending_apply)
-                    self.pending_apply = None
-                    self.status_var.set("Applying...")
-        except queue.Empty:
-            pass
-
-        if not self.closing:
-            self.after(100, self._poll_worker_results)
-
     def center_balance(self) -> None:
-        self.balance_var.set(0)
+        self.balance_slider.setValue(0)
         self._schedule_apply(0)
 
     def bump_balance(self, amount: int) -> None:
-        self.balance_var.set(max(-100, min(100, self.balance_var.get() + amount)))
+        self.balance_slider.setValue(max(-100, min(100, self.balance_slider.value() + amount)))
         self._schedule_apply(0)
 
     def reset(self) -> None:
-        self.boost_var.set(100)
-        self.balance_var.set(0)
+        self.boost_slider.setValue(100)
+        self.balance_slider.setValue(0)
         self._schedule_apply(0)
 
     def refresh_apo(self) -> None:
         self.apo = find_apo_config()
-        self.apo_var.set(self.apo.message)
+        self.apo_label.setText(self.apo.message)
         self.last_apo_boost = None
         self._capture_apo_snapshot()
         self._schedule_apply(0)
@@ -592,8 +852,7 @@ class HearingBoostApp(tk.Tk):
         try:
             APO_INSTALLER_PATH.parent.mkdir(parents=True, exist_ok=True)
             if not APO_INSTALLER_PATH.exists():
-                self.status_var.set("Downloading Equalizer APO installer...")
-                self.update_idletasks()
+                self.status_label.setText("Downloading Equalizer APO installer...")
                 download_apo_installer(APO_INSTALLER_PATH)
 
             subprocess.Popen(
@@ -607,18 +866,16 @@ class HearingBoostApp(tk.Tk):
                 ],
                 shell=False,
             )
-            self.status_var.set("Equalizer APO installer launched. Select your headset in Configurator, then reboot.")
+            self.status_label.setText("Equalizer APO installer launched. Select your headset in Configurator, then reboot.")
         except Exception as exc:
-            self.status_var.set(f"Could not launch Equalizer APO installer: {exc}")
+            self.status_label.setText(f"Could not launch Equalizer APO installer: {exc}")
 
     def restore_session(self) -> None:
-        if not self.session_only_var.get():
+        if not self.session_checkbox.isChecked():
             return
 
         errors: list[str] = []
-        if self.apply_after_id:
-            self.after_cancel(self.apply_after_id)
-            self.apply_after_id = None
+        self.apply_timer.stop()
 
         if self.apo_snapshot:
             try:
@@ -635,22 +892,34 @@ class HearingBoostApp(tk.Tk):
             try:
                 self.audio.restore_original()
             except Exception as exc:
-                errors.append(f"Windows audio: {exc}")
+                errors.append(f"Audio: {exc}")
 
         if errors:
-            messagebox.showwarning(APP_NAME, "Some settings could not be restored:\n" + "\n".join(errors))
+            QMessageBox.warning(self, APP_NAME, "Some settings could not be restored:\n" + "\n".join(errors))
 
-    def on_close(self) -> None:
+    def closeEvent(self, event) -> None:
         self.closing = True
-        self.apply_queue.put(None)
         self.restore_session()
-        self.destroy()
+        event.accept()
 
 
 def main() -> int:
-    app = HearingBoostApp()
-    app.mainloop()
-    return 0
+    if QT_IMPORT_ERROR:
+        print(
+            f"{APP_NAME} needs PySide6 for its native UI. Install it with: python3 -m pip install -r requirements.txt\n"
+            f"Import error: {QT_IMPORT_ERROR}",
+            file=sys.stderr,
+        )
+        return 1
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    icon = app_icon()
+    if icon:
+        app.setWindowIcon(icon)
+    window = HearingBoostApp()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
