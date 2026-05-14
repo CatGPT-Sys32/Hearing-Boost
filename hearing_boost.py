@@ -26,8 +26,10 @@ try:
         QMenu,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSlider,
         QSystemTrayIcon,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -46,8 +48,10 @@ except Exception as exc:  # pragma: no cover - shown at runtime
     QMenu = None
     QMessageBox = None
     QPushButton = None
+    QScrollArea = None
     QSlider = None
     QSystemTrayIcon = None
+    QTabWidget = None
     QVBoxLayout = None
     QWidget = None
     QT_IMPORT_ERROR = exc
@@ -69,9 +73,10 @@ else:
 
 
 APP_NAME = "Hearing Boost"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 GITHUB_URL = "https://github.com/CatGPT-Sys32"
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "hearing-boost-icon.svg"
+CHECKMARK_ICON_PATH = Path(__file__).resolve().parent / "assets" / "checkbox-check.svg"
 APO_DOWNLOAD_URL = "https://sourceforge.net/projects/equalizerapo/files/1.4.2/EqualizerAPO-x64-1.4.2.exe/download"
 APO_INSTALLER_PATH = Path(__file__).resolve().parent / "installers" / "EqualizerAPO-latest.exe"
 APO_CONFIG_CANDIDATES = [
@@ -112,6 +117,15 @@ class AudioDevice:
     id: str
     name: str
     is_default: bool = False
+
+
+@dataclass(frozen=True)
+class AppVolumeSession:
+    id: str
+    name: str
+    volume_percent: int
+    max_percent: int
+    detail: str = ""
 
 
 def is_admin() -> bool:
@@ -495,6 +509,202 @@ def create_audio_backend(device_id: str | None = None) -> WindowsAudio | LinuxAu
     raise RuntimeError(f"{sys.platform} is not supported yet.")
 
 
+def _volume_percent_from_linux_volume(value) -> int | None:
+    percentages: list[float] = []
+
+    def collect(node) -> None:
+        if isinstance(node, dict):
+            percent = node.get("value_percent")
+            if isinstance(percent, str):
+                match = re.search(r"(\d+(?:\.\d+)?)%", percent)
+                if match:
+                    percentages.append(float(match.group(1)))
+            for child in node.values():
+                collect(child)
+        elif isinstance(node, list):
+            for child in node:
+                collect(child)
+
+    collect(value)
+    if not percentages:
+        return None
+    return round(max(percentages))
+
+
+def _clean_linux_app_name(name: str, binary: str = "", app_id: str = "") -> str:
+    raw = (name or binary or app_id).strip()
+    lowered = raw.lower()
+    if app_id == "com.brave.Browser" or binary == "brave" or lowered.startswith("brave"):
+        return "Brave"
+    if binary == "spotify" or lowered == "spotify":
+        return "Spotify"
+    if raw:
+        return raw[:1].upper() + raw[1:] if raw.islower() else raw
+    return "Audio stream"
+
+
+def _linux_client_properties() -> dict[str, dict]:
+    try:
+        output = LinuxAudio._run_pactl("--format=json", "list", "clients")
+        clients = json.loads(output)
+    except Exception:
+        return {}
+
+    properties_by_client: dict[str, dict] = {}
+    for client in clients if isinstance(clients, list) else []:
+        index = client.get("index")
+        properties = client.get("properties")
+        if index is not None and isinstance(properties, dict):
+            properties_by_client[str(index)] = properties
+    return properties_by_client
+
+
+def list_app_volume_sessions() -> list[AppVolumeSession]:
+    if IS_WINDOWS:
+        return list_windows_app_volume_sessions()
+    if IS_LINUX:
+        return list_linux_app_volume_sessions()
+    return []
+
+
+def set_app_volume_session(session_id: str, volume_percent: int) -> None:
+    if IS_WINDOWS:
+        set_windows_app_volume_session(session_id, volume_percent)
+        return
+    if IS_LINUX:
+        set_linux_app_volume_session(session_id, volume_percent)
+        return
+    raise RuntimeError(f"{sys.platform} is not supported yet.")
+
+
+def list_windows_app_volume_sessions() -> list[AppVolumeSession]:
+    if not IS_WINDOWS or IMPORT_ERROR:
+        return []
+
+    comtypes.CoInitialize()
+    sessions: list[AppVolumeSession] = []
+    seen: set[str] = set()
+    for session in AudioUtilities.GetAllSessions():
+        volume = getattr(session, "SimpleAudioVolume", None)
+        if volume is None:
+            continue
+
+        process = getattr(session, "Process", None)
+        process_id = str(getattr(process, "pid", "") or getattr(session, "ProcessId", "") or "")
+        display_name = str(getattr(session, "DisplayName", "") or "").strip()
+        try:
+            process_name = process.name() if process else ""
+        except Exception:
+            process_name = ""
+        name = display_name or process_name or f"Audio session {process_id or len(sessions) + 1}"
+        session_id = process_id or name
+        if session_id in seen:
+            continue
+        seen.add(session_id)
+        try:
+            current = round(max(0.0, min(1.0, float(volume.GetMasterVolume()))) * 100.0)
+        except Exception:
+            continue
+        sessions.append(
+            AppVolumeSession(
+                id=session_id,
+                name=name,
+                volume_percent=current,
+                max_percent=500,
+                detail="",
+            )
+        )
+    return sorted(sessions, key=lambda item: item.name.lower())
+
+
+def set_windows_app_volume_session(session_id: str, volume_percent: float) -> None:
+    if not IS_WINDOWS or IMPORT_ERROR:
+        raise RuntimeError("Windows app audio controls are not available.")
+
+    comtypes.CoInitialize()
+    target = max(0.0, min(1.0, float(volume_percent) / 100.0))
+    matched = False
+    for session in AudioUtilities.GetAllSessions():
+        process = getattr(session, "Process", None)
+        process_id = str(getattr(process, "pid", "") or getattr(session, "ProcessId", "") or "")
+        display_name = str(getattr(session, "DisplayName", "") or "").strip()
+        try:
+            process_name = process.name() if process else ""
+        except Exception:
+            process_name = ""
+        candidate_id = process_id or display_name or process_name
+        if candidate_id == session_id and getattr(session, "SimpleAudioVolume", None):
+            session.SimpleAudioVolume.SetMasterVolume(target, None)
+            matched = True
+    if not matched:
+        raise RuntimeError("That Windows audio session is no longer active.")
+
+
+def list_linux_app_volume_sessions() -> list[AppVolumeSession]:
+    if not IS_LINUX or not shutil.which("pactl"):
+        return []
+
+    output = LinuxAudio._run_pactl("--format=json", "list", "sink-inputs")
+    try:
+        sink_inputs = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Could not parse pactl app volume information.") from exc
+
+    client_properties = _linux_client_properties()
+    grouped: dict[str, dict] = {}
+    for item in sink_inputs if isinstance(sink_inputs, list) else []:
+        index = item.get("index")
+        if index is None:
+            continue
+        properties = dict(client_properties.get(str(item.get("client")), {}))
+        stream_properties = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+        properties.update(stream_properties)
+        app_name = str(properties.get("application.name") or "").strip()
+        binary = str(properties.get("application.process.binary") or "").strip()
+        app_id = str(
+            properties.get("application.id")
+            or properties.get("pipewire.access.portal.app_id")
+            or ""
+        ).strip()
+        group_key = (app_id or binary or app_name or str(index)).lower()
+        current = _volume_percent_from_linux_volume(item.get("volume"))
+        if current is None:
+            continue
+
+        group = grouped.setdefault(
+            group_key,
+            {
+                "indexes": [],
+                "name": _clean_linux_app_name(app_name, binary, app_id),
+                "volume": current,
+            },
+        )
+        group["indexes"].append(str(index))
+        group["volume"] = max(int(group["volume"]), current)
+
+    sessions: list[AppVolumeSession] = []
+    for group in grouped.values():
+        indexes = sorted(group["indexes"], key=lambda value: int(value) if value.isdigit() else value)
+        sessions.append(
+            AppVolumeSession(
+                id="linux:" + "|".join(indexes),
+                name=str(group["name"]),
+                volume_percent=max(0, min(500, int(group["volume"]))),
+                max_percent=500,
+                detail="",
+            )
+        )
+    return sorted(sessions, key=lambda item: item.name.lower())
+
+
+def set_linux_app_volume_session(session_id: str, volume_percent: int) -> None:
+    if not IS_LINUX or not shutil.which("pactl"):
+        raise RuntimeError("Linux app audio controls are not available.")
+    sink_inputs = session_id.removeprefix("linux:").split("|")
+    for sink_input in [value for value in sink_inputs if value]:
+        LinuxAudio._run_pactl("set-sink-input-volume", sink_input, f"{max(0, min(500, volume_percent))}%")
+
+
 def make_separator() -> QFrame:
     line = QFrame()
     line.setObjectName("separator")
@@ -547,6 +757,10 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         self.selected_device_id: str | None = None
         self.quit_requested = False
         self.tray_notice_shown = False
+        self.app_volume_sliders: dict[str, QSlider] = {}
+        self.app_volume_labels: dict[str, QLabel] = {}
+        self.app_desired_volumes: dict[str, int] = {}
+        self.app_volume_loading = False
 
         self.apply_timer = QTimer(self)
         self.apply_timer.setSingleShot(True)
@@ -612,10 +826,41 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
                 color: #ffcf66;
                 font-size: 8.5pt;
             }}
+            QLabel#appName {{
+                color: #ffffff;
+                font-size: 10pt;
+                font-weight: 600;
+            }}
+            QLabel#appDetail {{
+                color: #8b8b84;
+                font-size: 8.5pt;
+            }}
             QFrame#separator {{
                 color: #222222;
                 background: #222222;
                 max-height: 1px;
+                border: 0;
+            }}
+            QFrame#appRow {{
+                border-bottom: 1px solid #202020;
+            }}
+            QTabWidget::pane {{
+                border: 0;
+                top: 10px;
+            }}
+            QTabBar::tab {{
+                background: #050505;
+                color: #ffffff;
+                border: 1px solid #303030;
+                padding: 8px 16px;
+                margin-right: 6px;
+            }}
+            QTabBar::tab:selected {{
+                background: #ffffff;
+                color: #000000;
+                border-color: #ffffff;
+            }}
+            QScrollArea {{
                 border: 0;
             }}
             QPushButton {{
@@ -660,7 +905,7 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             }}
             QCheckBox::indicator:checked {{
                 background: #ffffff;
-                image: none;
+                image: url("{CHECKMARK_ICON_PATH.as_posix()}");
             }}
             QSlider {{
                 min-height: 30px;
@@ -714,6 +959,25 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
         layout.addWidget(self.device_combo)
         layout.addSpacing(24)
 
+        self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        layout.addWidget(self.tabs, 1)
+
+        main_tab = QWidget()
+        self.main_layout = QVBoxLayout(main_tab)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
+        self.tabs.addTab(main_tab, "Main")
+        self._build_main_tab(self.main_layout)
+
+        app_tab = QWidget()
+        self.app_layout = QVBoxLayout(app_tab)
+        self.app_layout.setContentsMargins(0, 0, 0, 0)
+        self.app_layout.setSpacing(0)
+        self.tabs.addTab(app_tab, "App Management")
+        self._build_app_tab(self.app_layout)
+
+    def _build_main_tab(self, layout: QVBoxLayout) -> None:
         boost_header = QHBoxLayout()
         boost_header.setContentsMargins(0, 0, 0, 0)
         boost_title = QLabel("Boost")
@@ -835,6 +1099,181 @@ class HearingBoostApp(QT_MAIN_WINDOW_BASE):
             apo_controls.addWidget(self.refresh_button)
             apo_controls.addStretch(1)
             layout.addLayout(apo_controls)
+
+    def _build_app_tab(self, layout: QVBoxLayout) -> None:
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Running apps with audio")
+        title.setObjectName("section")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.app_refresh_button = QPushButton("Refresh")
+        self.app_refresh_button.clicked.connect(self.refresh_app_sessions)
+        header.addWidget(self.app_refresh_button)
+        layout.addLayout(header)
+        layout.addSpacing(8)
+
+        layout.addSpacing(10)
+
+        self.app_scroll = QScrollArea()
+        self.app_scroll.setWidgetResizable(True)
+        self.app_scroll_content = QWidget()
+        self.app_rows = QVBoxLayout(self.app_scroll_content)
+        self.app_rows.setContentsMargins(0, 0, 0, 0)
+        self.app_rows.setSpacing(0)
+        self.app_scroll.setWidget(self.app_scroll_content)
+        layout.addWidget(self.app_scroll, 1)
+
+        self.app_status_label = QLabel("Select Refresh to scan active audio streams.")
+        self.app_status_label.setObjectName("status")
+        self.app_status_label.setWordWrap(True)
+        layout.addSpacing(12)
+        layout.addWidget(self.app_status_label)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.tabText(index) != "App Management":
+            return
+        self._neutralize_global_boost()
+        self.refresh_app_sessions()
+
+    def _neutralize_global_boost(self) -> None:
+        if self.boost_slider.value() == 100:
+            return
+        self.boost_slider.setValue(100)
+        self._schedule_apply(0, final=True)
+
+    def _clear_app_rows(self) -> None:
+        while self.app_rows.count():
+            item = self.app_rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.app_volume_sliders.clear()
+        self.app_volume_labels.clear()
+
+    def refresh_app_sessions(self) -> None:
+        self._neutralize_global_boost()
+        self._clear_app_rows()
+        self.app_volume_loading = True
+        try:
+            sessions = list_app_volume_sessions()
+        except Exception as exc:
+            self.app_status_label.setText(f"Could not read app audio sessions: {exc}")
+            self.app_volume_loading = False
+            return
+
+        if not sessions:
+            empty = QLabel("No active app audio streams found.")
+            empty.setObjectName("caption")
+            self.app_rows.addWidget(empty)
+            self.app_rows.addStretch(1)
+            self.app_status_label.setText("Start playback in an app, then refresh.")
+            self.app_volume_loading = False
+            return
+
+        for session in sessions:
+            if session.id not in self.app_desired_volumes:
+                self.app_desired_volumes[session.id] = session.volume_percent
+            self._add_app_session_row(session)
+        self.app_rows.addStretch(1)
+        self.app_status_label.setText(f"Found {len(sessions)} active audio stream{'s' if len(sessions) != 1 else ''}.")
+        self.app_volume_loading = False
+
+    def _add_app_session_row(self, session: AppVolumeSession) -> None:
+        row = QFrame()
+        row.setObjectName("appRow")
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 12, 0, 14)
+        row_layout.setSpacing(7)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        name = QLabel(session.name)
+        name.setObjectName("appName")
+        name.setWordWrap(True)
+        header.addWidget(name, 1)
+        value = QLabel(f"{self.app_desired_volumes.get(session.id, session.volume_percent)}%")
+        value.setObjectName("balanceMetric")
+        header.addWidget(value)
+        row_layout.addLayout(header)
+
+        if session.detail:
+            detail = QLabel(session.detail)
+            detail.setObjectName("appDetail")
+            detail.setWordWrap(True)
+            row_layout.addWidget(detail)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, session.max_percent)
+        slider.setValue(max(0, min(session.max_percent, self.app_desired_volumes.get(session.id, session.volume_percent))))
+        slider.valueChanged.connect(lambda value, session_id=session.id: self._on_app_volume_changed(session_id, value))
+        slider.sliderReleased.connect(lambda session_id=session.id: self._apply_app_volume(session_id))
+        row_layout.addWidget(slider)
+        row_layout.addLayout(self._mark_row("0%", f"{session.max_percent}%"))
+
+        self.app_volume_sliders[session.id] = slider
+        self.app_volume_labels[session.id] = value
+        self.app_rows.addWidget(row)
+
+    def _on_app_volume_changed(self, session_id: str, value: int) -> None:
+        label = self.app_volume_labels.get(session_id)
+        if label:
+            label.setText(f"{value}%")
+        if self.app_volume_loading:
+            return
+        if not IS_WINDOWS:
+            self._neutralize_global_boost()
+        self.app_desired_volumes[session_id] = value
+
+    def _apply_app_volume(self, session_id: str) -> None:
+        slider = self.app_volume_sliders.get(session_id)
+        if slider is None:
+            return
+        self.app_desired_volumes[session_id] = slider.value()
+        try:
+            if IS_WINDOWS:
+                self._apply_windows_effective_app_volumes()
+            else:
+                self._neutralize_global_boost()
+                set_app_volume_session(session_id, slider.value())
+        except Exception as exc:
+            self.app_status_label.setText(f"Could not set app volume: {exc}")
+            return
+        self.app_status_label.setText(f"Applied app volume {slider.value()}%.")
+
+    def _apply_windows_effective_app_volumes(self) -> None:
+        active_ids = set(self.app_volume_sliders)
+        desired = {
+            session_id: max(0, min(500, volume))
+            for session_id, volume in self.app_desired_volumes.items()
+            if session_id in active_ids
+        }
+        if not desired:
+            return
+
+        backing_boost = max(100, max(desired.values()))
+        if backing_boost > 100 and not (self.apo.path and self.apo.writable):
+            raise RuntimeError("Effective app volume above 100% needs Equalizer APO. Install or refresh APO first.")
+
+        self.apply_timer.stop()
+        if self.apply_future and not self.apply_future.done():
+            self.apply_future.result(timeout=2)
+            self.apply_future = None
+
+        if self.boost_slider.value() != 100:
+            self.boost_slider.blockSignals(True)
+            self.boost_slider.setValue(100)
+            self.boost_slider.blockSignals(False)
+            self._update_labels()
+
+        self._apply_settings_blocking(backing_boost, self.balance_slider.value(), True)
+        for session_id, effective_volume in desired.items():
+            mixer_volume = 0.0 if backing_boost <= 0 else (effective_volume / backing_boost) * 100.0
+            set_windows_app_volume_session(session_id, mixer_volume)
+
+        self.left_label.setText("L 100%")
+        self.right_label.setText("R 100%")
+        self.status_label.setText(f"App Management backing boost: {backing_boost}%.")
 
     def _build_tray(self) -> None:
         self.tray = None
